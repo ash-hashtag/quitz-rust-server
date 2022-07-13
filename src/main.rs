@@ -11,12 +11,11 @@ use mongodb::{
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde_json;
-use dotenv::dotenv;
 use actix_governor::{Governor, GovernorConfigBuilder};
 
 #[actix_web::main]
 async fn main() {
-    dotenv().ok();
+    dotenv::dotenv().ok();
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(60)
         .burst_size(20)
@@ -39,7 +38,7 @@ async fn main() {
             .service(text_question)
             .service(post_answer)
     })
-    .bind(("127.0.0.1", 8080))
+    .bind(("0.0.0.0", 8080))
     .unwrap()
     .run()
     .await;
