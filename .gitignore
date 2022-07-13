@@ -1,6 +1,2 @@
 /target
 .env
-.gitignore
-.git
-Dockerfile
-.dockerignore
