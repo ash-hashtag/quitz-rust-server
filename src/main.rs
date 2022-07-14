@@ -17,7 +17,7 @@ async fn main() {
     dotenv::dotenv().ok();
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(60)
-        .burst_size(60)
+        .burst_size(120)
         .finish()
         .unwrap();
 
@@ -58,7 +58,7 @@ async fn rootrequest(request: HttpRequest) -> impl Responder {
     ))
 }
 
-const MAX_LEN: usize = 10;
+const MAX_LEN: usize = 20;
 
 #[post("/ques")]
 async fn get_specific_questions(
@@ -66,7 +66,10 @@ async fn get_specific_questions(
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
     let ids = match serde_json::from_slice::<Vec<String>>(&body) {
-        Ok(val) => val,
+        Ok(mut val) => {
+            val.truncate(MAX_LEN);
+            val
+        }
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
     let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None) {
@@ -185,11 +188,11 @@ async fn post_answer(
             };
             if let Ok(a) = params.0.parse::<usize>() {
                 if a < len {
-                    return match collection.update_one(
-                        doc! {"_id": &params.1},
-                        doc! {"$inc": {format!("a.{:?}", &params.0): 1}},
-                        None,
-                    ) {
+                    let update = doc! {
+                        "$inc" : {format!("a.{}", a) : 1},
+                    };
+                    println!("updating ans...{:?}", update);
+                    return match collection.update_one(doc! {"_id": &params.1}, update, None) {
                         Ok(_) => ok_req,
                         Err(_) => server_err,
                     };
