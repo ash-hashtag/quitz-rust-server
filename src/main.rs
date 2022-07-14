@@ -1,4 +1,4 @@
-// use actix_ratelimit::{MemoryStore, MemoryStoreActor, RateLimiter};
+use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
     get, post,
     web::{Bytes, Data, Path},
@@ -11,32 +11,35 @@ use mongodb::{
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde_json;
-use actix_governor::{Governor, GovernorConfigBuilder};
 
 #[actix_web::main]
 async fn main() {
     dotenv::dotenv().ok();
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(60)
-        .burst_size(20)
+        .burst_size(60)
         .finish()
         .unwrap();
 
     let _ = HttpServer::new(move || {
-        let client_options =
-            ClientOptions::parse_with_resolver_config(&std::env::var("DBURL").unwrap(), ResolverConfig::cloudflare())
-                .unwrap();
+        let client_options = ClientOptions::parse_with_resolver_config(
+            &std::env::var("DBURL").unwrap(),
+            ResolverConfig::cloudflare(),
+        )
+        .unwrap();
         let client = Client::with_options(client_options).unwrap();
         println!("server running...");
         let collection: Collection<Document> = client.database("quitz").collection("questions");
         let app_data = Data::new(collection);
-        App::new().wrap(Governor::new(&governor_conf))
+        App::new()
+            .wrap(Governor::new(&governor_conf))
             .app_data(app_data)
             .service(rootrequest)
             .service(get_questions)
             .service(post_question)
             .service(text_question)
             .service(post_answer)
+            .service(get_specific_questions)
     })
     .bind(("0.0.0.0", 8080))
     .unwrap()
@@ -48,33 +51,65 @@ async fn main() {
 async fn rootrequest(request: HttpRequest) -> impl Responder {
     HttpResponse::Ok().body(format!(
         "I know your ip {:?}",
-        request.connection_info().realip_remote_addr().unwrap()
+        request
+            .connection_info()
+            .realip_remote_addr()
+            .unwrap_or("oops I don't know")
     ))
 }
 
-#[get("/getques/{len}")]
-async fn get_questions(len: Path<u32>, collection: Data<Collection<Document>>) -> impl Responder {
-    const MAX_LEN: u32 = 10;
+const MAX_LEN: usize = 10;
 
-    let len = len.into_inner();
-    let aggregator = [doc! {
-        "$sample" : {"size": if  len > MAX_LEN {MAX_LEN} else {len}}
-    }];
-    let mut cursor = match collection.aggregate(aggregator, None) {
+#[post("/ques")]
+async fn get_specific_questions(
+    body: Bytes,
+    collection: Data<Collection<Document>>,
+) -> impl Responder {
+    let ids = match serde_json::from_slice::<Vec<String>>(&body) {
+        Ok(val) => val,
+        Err(_) => return HttpResponse::BadRequest().finish(),
+    };
+    let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None) {
+        Ok(ques) => ques,
+        Err(_) => return HttpResponse::BadRequest().finish(),
+    };
+    let mut docs: Vec<Document> = Vec::with_capacity(ids.len());
+    while let Some(result) = cursor.next() {
+        match result {
+            Ok(data) => docs.push(data),
+            Err(_) => break,
+        };
+    }
+    HttpResponse::Ok().body(serde_json::to_string(&docs).unwrap())
+}
+
+#[get("/getques/{len}")]
+async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>) -> impl Responder {
+    let len = match len.into_inner() {
+        length => {
+            if length < MAX_LEN {
+                length
+            } else {
+                MAX_LEN
+            }
+        }
+    };
+    let mut cursor = match collection.aggregate(
+        [doc! {"$sample" : {"size": u32::try_from(len).unwrap()}}],
+        None,
+    ) {
         Ok(res) => res,
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
-    let mut data = vec![];
+    let mut data = Vec::with_capacity(len);
+
     while let Some(doc) = cursor.next() {
         match doc {
             Ok(d) => data.push(d),
             Err(_) => break,
         };
     }
-    match serde_json::to_string(&data) {
-        Ok(d) => HttpResponse::Ok().body(d),
-        Err(_) => HttpResponse::InternalServerError().finish(),
-    }
+    HttpResponse::Ok().body(serde_json::to_string(&data).unwrap_or("".to_string()))
 }
 
 #[post("/postques")]
