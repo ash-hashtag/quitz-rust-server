@@ -1,7 +1,7 @@
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
     get, post,
-    web::{Bytes, Data, Path, self},
+    web::{self, Bytes, Data, Path},
     App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use mongodb::{
@@ -126,6 +126,18 @@ async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> i
         Ok(d) => d,
         _ => return server_error(),
     };
+    if data.contains_key("q") {
+        match data.get_str("q") {
+            Ok(q) => {
+                if q.len() > 300 {
+                    return bad_req();
+                }
+            }
+            _ => return bad_req(),
+        };
+    } else {
+        return bad_req();
+    }
     let choices_type = match data.contains_key("c") {
         true => true,
         _ => match data.contains_key("mc") {
@@ -242,13 +254,17 @@ async fn post_answer(
                 _ => bad_req(),
             }
         } else {
-            match collection.update_one(
-                doc! {"_id": &params.1},
-                doc! {"$push": {"a": &params.0} },
-                None,
-            ) {
-                Ok(_) => ok_req(),
-                _ => server_err(),
+            if params.0.len() < 300 {
+                match collection.update_one(
+                    doc! {"_id": &params.1},
+                    doc! {"$push": {"a": &params.0} },
+                    None,
+                ) {
+                    Ok(_) => ok_req(),
+                    _ => server_err(),
+                }
+            } else {
+                bad_req()
             }
         }
     } else {
