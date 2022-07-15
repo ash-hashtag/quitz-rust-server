@@ -127,7 +127,7 @@ async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> i
     let choices_type = match data.contains_key("c") {
         true => true,
         false => match data.contains_key("mc") {
-            true => true,
+            true => false,
             false => return bad_req,
         },
     };
@@ -191,7 +191,6 @@ async fn post_answer(
                     let update = doc! {
                         "$inc" : {format!("a.{}", a) : 1},
                     };
-                    println!("updating ans...{:?}", update);
                     return match collection.update_one(doc! {"_id": &params.1}, update, None) {
                         Ok(_) => ok_req,
                         Err(_) => server_err,
@@ -249,5 +248,5 @@ async fn post_answer(
 }
 
 fn random_id() -> String {
-    Alphanumeric.sample_string(&mut rand::thread_rng(), 16)
+    Alphanumeric.sample_string(&mut rand::thread_rng(), 8)
 }
