@@ -1,7 +1,7 @@
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
     get, post,
-    web::{Bytes, Data, Path},
+    web::{Bytes, Data, Path, self},
     App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use mongodb::{
@@ -33,6 +33,7 @@ async fn main() {
         let app_data = Data::new(collection);
         App::new()
             .wrap(Governor::new(&governor_conf))
+            .app_data(web::PayloadConfig::new(1 << 10))
             .app_data(app_data)
             .service(rootrequest)
             .service(get_questions)
@@ -68,19 +69,20 @@ async fn get_specific_questions(
     let ids = match serde_json::from_slice::<Vec<String>>(&body) {
         Ok(mut val) => {
             val.truncate(MAX_LEN);
+            val.retain(|x| x.len() < 9);
             val
         }
-        Err(_) => return HttpResponse::BadRequest().finish(),
+        _ => return HttpResponse::BadRequest().finish(),
     };
     let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None) {
         Ok(ques) => ques,
-        Err(_) => return HttpResponse::BadRequest().finish(),
+        _ => return HttpResponse::BadRequest().finish(),
     };
     let mut docs: Vec<Document> = Vec::with_capacity(ids.len());
     while let Some(result) = cursor.next() {
         match result {
             Ok(data) => docs.push(data),
-            Err(_) => break,
+            _ => break,
         };
     }
     HttpResponse::Ok().body(serde_json::to_string(&docs).unwrap())
@@ -102,42 +104,42 @@ async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>)
         None,
     ) {
         Ok(res) => res,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        _ => return HttpResponse::InternalServerError().finish(),
     };
     let mut data = Vec::with_capacity(len);
 
     while let Some(doc) = cursor.next() {
         match doc {
             Ok(d) => data.push(d),
-            Err(_) => break,
+            _ => break,
         };
     }
-    HttpResponse::Ok().body(serde_json::to_string(&data).unwrap_or("".to_string()))
+    HttpResponse::Ok().body(serde_json::to_string(&data).unwrap())
 }
 
 #[post("/postques")]
 async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> impl Responder {
-    let server_error = HttpResponse::InternalServerError().finish();
-    let bad_req = HttpResponse::BadRequest().finish();
+    let server_error = || HttpResponse::InternalServerError().finish();
+    let bad_req = || HttpResponse::BadRequest().finish();
 
     let mut data = match serde_json::from_slice::<Document>(&body) {
         Ok(d) => d,
-        Err(_) => return server_error,
+        _ => return server_error(),
     };
     let choices_type = match data.contains_key("c") {
         true => true,
-        false => match data.contains_key("mc") {
+        _ => match data.contains_key("mc") {
             true => false,
-            false => return bad_req,
+            _ => return bad_req(),
         },
     };
     let len = match match data.get_array(if choices_type { "c" } else { "mc" }) {
         Ok(arr) => arr.len(),
-        Err(_) => return bad_req,
+        _ => return bad_req(),
     } {
         length => {
             if length > 8 {
-                return bad_req;
+                return bad_req();
             } else {
                 length
             }
@@ -148,7 +150,7 @@ async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> i
     let _ = data.insert("a", vec![0; len]);
     match collection.insert_one(data, None) {
         Ok(_) => HttpResponse::Ok().body(id),
-        Err(_) => server_error,
+        _ => server_error(),
     }
 }
 
@@ -157,6 +159,9 @@ async fn text_question(
     question: Path<String>,
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
+    if question.len() > 300 {
+        return HttpResponse::BadRequest().finish();
+    }
     let question = question.into_inner();
     let id = random_id();
     match collection.insert_one(
@@ -177,73 +182,77 @@ async fn post_answer(
     params: Path<(String, String)>,
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
-    let server_err = HttpResponse::InternalServerError().finish();
-    let ok_req = HttpResponse::Ok().finish();
-    let bad_req = HttpResponse::BadRequest().finish();
+    let server_err = || HttpResponse::InternalServerError().finish();
+    let ok_req = || HttpResponse::Ok().finish();
+    let bad_req = || HttpResponse::BadRequest().finish();
     if let Ok(Some(question)) = collection.find_one(doc! {"_id": &params.1}, None) {
         if question.contains_key("c") {
             let len = match question.get_array("c") {
                 Ok(arr) => arr.len(),
-                Err(_) => return server_err,
+                _ => return server_err(),
             };
             if let Ok(a) = params.0.parse::<usize>() {
-                if a < len {
+                if a < len && a > 0 {
                     let update = doc! {
                         "$inc" : {format!("a.{}", a) : 1},
                     };
-                    return match collection.update_one(doc! {"_id": &params.1}, update, None) {
-                        Ok(_) => ok_req,
-                        Err(_) => server_err,
-                    };
+                    match collection.update_one(doc! {"_id": &params.1}, update, None) {
+                        Ok(_) => ok_req(),
+                        Err(_) => server_err(),
+                    }
                 } else {
-                    return bad_req;
+                    bad_req()
                 }
             } else {
-                return bad_req;
+                bad_req()
             }
         } else if question.contains_key("mc") {
             let len = match question.get_array("mc") {
                 Ok(l) => l.len(),
-                Err(_) => return server_err,
+                Err(_) => return server_err(),
             };
             match params.0.parse::<usize>() {
                 Ok(a) => {
-                    let max_value = (1 << len) - 1;
-                    let mut update = doc! {};
-                    for i in 0..len {
-                        let cur_choice = 1 << i;
-                        if (cur_choice & a) == cur_choice {
-                            update.insert(format!("a.{}", i), 1);
+                    if a > 0 {
+                        let max_value = (1 << len) - 1;
+                        let mut update = doc! {};
+                        for i in 0..len {
+                            let cur_choice = 1 << i;
+                            if (cur_choice & a) == cur_choice {
+                                update.insert(format!("a.{}", i), 1);
+                            }
                         }
-                    }
-                    if a > max_value {
-                        return bad_req;
+                        if a > max_value {
+                            bad_req()
+                        } else {
+                            match collection.update_one(
+                                doc! {"_id": &params.1},
+                                doc! {
+                                "$inc" : &update },
+                                None,
+                            ) {
+                                Ok(_) => ok_req(),
+                                _ => server_err(),
+                            }
+                        }
                     } else {
-                        return match collection.update_one(
-                            doc! {"_id": &params.1},
-                            doc! {
-                            "$inc" : &update },
-                            None,
-                        ) {
-                            Ok(_) => ok_req,
-                            Err(_) => server_err,
-                        };
+                        bad_req()
                     }
                 }
-                Err(_) => return bad_req,
-            };
+                _ => bad_req(),
+            }
         } else {
-            return match collection.update_one(
+            match collection.update_one(
                 doc! {"_id": &params.1},
                 doc! {"$push": {"a": &params.0} },
                 None,
             ) {
-                Ok(_) => ok_req,
-                Err(_) => server_err,
-            };
+                Ok(_) => ok_req(),
+                _ => server_err(),
+            }
         }
     } else {
-        return server_err;
+        server_err()
     }
 }
 
