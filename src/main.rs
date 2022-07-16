@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
     get, post,
@@ -5,11 +7,10 @@ use actix_web::{
     App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, oid::ObjectId, Document},
     options::{ClientOptions, ResolverConfig},
     sync::{Client, Collection},
 };
-use rand::distributions::{Alphanumeric, DistString};
 use serde_json;
 
 #[actix_web::main]
@@ -66,17 +67,16 @@ async fn get_specific_questions(
     body: Bytes,
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
-    let ids = match serde_json::from_slice::<Vec<String>>(&body) {
+    let ids = match serde_json::from_slice::<Vec<ObjectId>>(&body) {
         Ok(mut val) => {
             val.truncate(MAX_LEN);
-            val.retain(|x| x.len() < 9);
             val
         }
-        _ => return HttpResponse::BadRequest().finish(),
+        _ => return bad_req(),
     };
     let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None) {
         Ok(ques) => ques,
-        _ => return HttpResponse::BadRequest().finish(),
+        _ => return bad_req(),
     };
     let mut docs: Vec<Document> = Vec::with_capacity(ids.len());
     while let Some(result) = cursor.next() {
@@ -104,7 +104,7 @@ async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>)
         None,
     ) {
         Ok(res) => res,
-        _ => return HttpResponse::InternalServerError().finish(),
+        _ => return server_err(),
     };
     let mut data = Vec::with_capacity(len);
 
@@ -119,12 +119,9 @@ async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>)
 
 #[post("/postques")]
 async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> impl Responder {
-    let server_error = || HttpResponse::InternalServerError().finish();
-    let bad_req = || HttpResponse::BadRequest().finish();
-
     let mut data = match serde_json::from_slice::<Document>(&body) {
         Ok(d) => d,
-        _ => return server_error(),
+        _ => return server_err(),
     };
     if data.contains_key("q") {
         match data.get_str("q") {
@@ -157,12 +154,10 @@ async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> i
             }
         }
     };
-    let id = random_id();
-    let _ = data.insert("_id", &id);
-    let _ = data.insert("a", vec![0; len]);
+    let _ = data.insert("a", vec![u32::MIN; len]);
     match collection.insert_one(data, None) {
-        Ok(_) => HttpResponse::Ok().body(id),
-        _ => server_error(),
+        Ok(res) => HttpResponse::Ok().body(res.inserted_id.to_string()),
+        _ => server_err(),
     }
 }
 
@@ -172,20 +167,19 @@ async fn text_question(
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
     if question.len() > 300 {
-        return HttpResponse::BadRequest().finish();
+        return bad_req();
     }
+    
     let question = question.into_inner();
-    let id = random_id();
     match collection.insert_one(
         doc! {
-            "_id": &id,
             "q": question,
             "a": []
         },
         None,
     ) {
-        Ok(_) => HttpResponse::Ok().body(id),
-        Err(_) => HttpResponse::InternalServerError().finish(),
+        Ok(res) => HttpResponse::Ok().body(res.inserted_id.to_string()),
+        _ => server_err(),
     }
 }
 
@@ -194,21 +188,22 @@ async fn post_answer(
     params: Path<(String, String)>,
     collection: Data<Collection<Document>>,
 ) -> impl Responder {
-    let server_err = || HttpResponse::InternalServerError().finish();
-    let ok_req = || HttpResponse::Ok().finish();
-    let bad_req = || HttpResponse::BadRequest().finish();
-    if let Ok(Some(question)) = collection.find_one(doc! {"_id": &params.1}, None) {
+    let id = match ObjectId::from_str(&params.1) {
+        Ok(val) => val,
+        _ => return bad_req(),
+    };
+    if let Ok(Some(question)) = collection.find_one(doc! {"_id": &id}, None) {
         if question.contains_key("c") {
             let len = match question.get_array("c") {
                 Ok(arr) => arr.len(),
                 _ => return server_err(),
             };
             if let Ok(a) = params.0.parse::<usize>() {
-                if a < len && a > 0 {
+                if a < len {
                     let update = doc! {
-                        "$inc" : {format!("a.{}", a) : 1},
+                        "$inc" : {format!("a.{}", a) : u32::MIN + 1},
                     };
-                    match collection.update_one(doc! {"_id": &params.1}, update, None) {
+                    match collection.update_one(doc! {"_id": &id}, update, None) {
                         Ok(_) => ok_req(),
                         Err(_) => server_err(),
                     }
@@ -238,7 +233,7 @@ async fn post_answer(
                             bad_req()
                         } else {
                             match collection.update_one(
-                                doc! {"_id": &params.1},
+                                doc! {"_id": &id},
                                 doc! {
                                 "$inc" : &update },
                                 None,
@@ -256,7 +251,7 @@ async fn post_answer(
         } else {
             if params.0.len() < 300 {
                 match collection.update_one(
-                    doc! {"_id": &params.1},
+                    doc! {"_id": &id},
                     doc! {"$push": {"a": &params.0} },
                     None,
                 ) {
@@ -272,6 +267,14 @@ async fn post_answer(
     }
 }
 
-fn random_id() -> String {
-    Alphanumeric.sample_string(&mut rand::thread_rng(), 8)
+fn bad_req() -> HttpResponse {
+    HttpResponse::BadRequest().finish()
+}
+
+fn server_err() -> HttpResponse {
+    HttpResponse::InternalServerError().finish()
+}
+
+fn ok_req() -> HttpResponse {
+    HttpResponse::Ok().finish()
 }
