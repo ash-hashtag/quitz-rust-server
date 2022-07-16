@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
@@ -22,15 +22,23 @@ async fn main() {
         .finish()
         .unwrap();
 
+    let options = ClientOptions::parse_with_resolver_config(
+        &std::env::var("DBURL").unwrap(),
+        ResolverConfig::cloudflare(),
+    )
+    .unwrap();
+
+    let arc_client = Arc::new(Client::with_options(options).unwrap());
+
     let _ = HttpServer::new(move || {
-        let client_options = ClientOptions::parse_with_resolver_config(
-            &std::env::var("DBURL").unwrap(),
-            ResolverConfig::cloudflare(),
-        )
-        .unwrap();
-        let client = Client::with_options(client_options).unwrap();
+        // let client_options = ClientOptions::parse_with_resolver_config(
+        //     &std::env::var("DBURL").unwrap(),
+        //     ResolverConfig::cloudflare(),
+        // )
+        // .unwrap();
+        // let client = Client::with_options(client_options).unwrap();
         println!("server running...");
-        let collection: Collection<Document> = client.database("quitz").collection("questions");
+        let collection: Collection<Document> = arc_client.database("quitz").collection("questions");
         let app_data = Data::new(collection);
         App::new()
             .wrap(Governor::new(&governor_conf))
@@ -169,7 +177,7 @@ async fn text_question(
     if question.len() > 300 {
         return bad_req();
     }
-    
+
     let question = question.into_inner();
     match collection.insert_one(
         doc! {
