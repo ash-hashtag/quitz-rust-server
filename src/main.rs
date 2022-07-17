@@ -1,4 +1,7 @@
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{
@@ -9,8 +12,9 @@ use actix_web::{
 use mongodb::{
     bson::{doc, oid::ObjectId, Document},
     options::{ClientOptions, ResolverConfig},
-    sync::{Client, Collection},
+    Client, Collection,
 };
+use rand::Rng;
 use serde_json;
 
 #[actix_web::main]
@@ -26,9 +30,11 @@ async fn main() {
         &std::env::var("DBURL").unwrap(),
         ResolverConfig::cloudflare(),
     )
+    .await
     .unwrap();
 
     let arc_client = Arc::new(Client::with_options(options).unwrap());
+    let cached_docs: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let _ = HttpServer::new(move || {
         // let client_options = ClientOptions::parse_with_resolver_config(
@@ -37,12 +43,14 @@ async fn main() {
         // )
         // .unwrap();
         // let client = Client::with_options(client_options).unwrap();
+        let cached_data = Data::new(cached_docs.clone());
         println!("server running...");
         let collection: Collection<Document> = arc_client.database("quitz").collection("questions");
         let app_data = Data::new(collection);
         App::new()
             .wrap(Governor::new(&governor_conf))
             .app_data(web::PayloadConfig::new(1 << 10))
+            .app_data(cached_data)
             .app_data(app_data)
             .service(rootrequest)
             .service(get_questions)
@@ -82,13 +90,13 @@ async fn get_specific_questions(
         }
         _ => return bad_req(),
     };
-    let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None) {
+    let mut cursor = match collection.find(doc! {"_id": {"$in": &ids}}, None).await {
         Ok(ques) => ques,
         _ => return bad_req(),
     };
     let mut docs: Vec<Document> = Vec::with_capacity(ids.len());
-    while let Some(result) = cursor.next() {
-        match result {
+    while cursor.advance().await.unwrap_or(false) {
+        match cursor.deserialize_current() {
             Ok(data) => docs.push(data),
             _ => break,
         };
@@ -97,7 +105,17 @@ async fn get_specific_questions(
 }
 
 #[get("/getques/{len}")]
-async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>) -> impl Responder {
+async fn get_questions(
+    len: Path<usize>,
+    collection: Data<Collection<Document>>,
+    prev_req: Data<Arc<Mutex<Option<String>>>>,
+) -> impl Responder {
+    if rand::thread_rng().gen_bool(1.5 / 2.0) {
+        if let Some(body) = prev_req.lock().unwrap().clone() {
+            return HttpResponse::Ok().body(body);
+        }
+    }
+
     let len = match len.into_inner() {
         length => {
             if length < MAX_LEN {
@@ -107,22 +125,27 @@ async fn get_questions(len: Path<usize>, collection: Data<Collection<Document>>)
             }
         }
     };
-    let mut cursor = match collection.aggregate(
-        [doc! {"$sample" : {"size": u32::try_from(len).unwrap()}}],
-        None,
-    ) {
+    let mut cursor = match collection
+        .aggregate(
+            [doc! {"$sample" : {"size": u32::try_from(len).unwrap()}}],
+            None,
+        )
+        .await
+    {
         Ok(res) => res,
         _ => return server_err(),
     };
     let mut data = Vec::with_capacity(len);
 
-    while let Some(doc) = cursor.next() {
-        match doc {
+    while cursor.advance().await.unwrap_or(false) {
+        match cursor.deserialize_current() {
             Ok(d) => data.push(d),
             _ => break,
         };
     }
-    HttpResponse::Ok().body(serde_json::to_string(&data).unwrap())
+    let data = serde_json::to_string(&data).unwrap();
+    *prev_req.lock().unwrap() = Some(data.clone());
+    HttpResponse::Ok().body(data)
 }
 
 #[post("/postques")]
@@ -163,7 +186,7 @@ async fn post_question(body: Bytes, collection: Data<Collection<Document>>) -> i
         }
     };
     let _ = data.insert("a", vec![u32::MIN; len]);
-    match collection.insert_one(data, None) {
+    match collection.insert_one(data, None).await {
         Ok(res) => HttpResponse::Ok().body(res.inserted_id.to_string()),
         _ => server_err(),
     }
@@ -179,13 +202,16 @@ async fn text_question(
     }
 
     let question = question.into_inner();
-    match collection.insert_one(
-        doc! {
-            "q": question,
-            "a": []
-        },
-        None,
-    ) {
+    match collection
+        .insert_one(
+            doc! {
+                "q": question,
+                "a": []
+            },
+            None,
+        )
+        .await
+    {
         Ok(res) => HttpResponse::Ok().body(res.inserted_id.to_string()),
         _ => server_err(),
     }
@@ -200,7 +226,7 @@ async fn post_answer(
         Ok(val) => val,
         _ => return bad_req(),
     };
-    if let Ok(Some(question)) = collection.find_one(doc! {"_id": &id}, None) {
+    if let Ok(Some(question)) = collection.find_one(doc! {"_id": &id}, None).await {
         if question.contains_key("c") {
             let len = match question.get_array("c") {
                 Ok(arr) => arr.len(),
@@ -211,9 +237,9 @@ async fn post_answer(
                     let update = doc! {
                         "$inc" : {format!("a.{}", a) : u32::MIN + 1},
                     };
-                    match collection.update_one(doc! {"_id": &id}, update, None) {
+                    match collection.update_one(doc! {"_id": &id}, update, None).await {
                         Ok(_) => ok_req(),
-                        Err(_) => server_err(),
+                        _ => server_err(),
                     }
                 } else {
                     bad_req()
@@ -240,12 +266,15 @@ async fn post_answer(
                         if a > max_value {
                             bad_req()
                         } else {
-                            match collection.update_one(
-                                doc! {"_id": &id},
-                                doc! {
-                                "$inc" : &update },
-                                None,
-                            ) {
+                            match collection
+                                .update_one(
+                                    doc! {"_id": &id},
+                                    doc! {
+                                    "$inc" : &update },
+                                    None,
+                                )
+                                .await
+                            {
                                 Ok(_) => ok_req(),
                                 _ => server_err(),
                             }
@@ -258,11 +287,10 @@ async fn post_answer(
             }
         } else {
             if params.0.len() < 300 {
-                match collection.update_one(
-                    doc! {"_id": &id},
-                    doc! {"$push": {"a": &params.0} },
-                    None,
-                ) {
+                match collection
+                    .update_one(doc! {"_id": &id}, doc! {"$push": {"a": &params.0} }, None)
+                    .await
+                {
                     Ok(_) => ok_req(),
                     _ => server_err(),
                 }

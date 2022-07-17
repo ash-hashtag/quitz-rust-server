@@ -10,8 +10,9 @@ actix-web = "4"
 serde_json = "1.0"
 actix-governor = "0.3.0"
 dotenv = "0.15.0"
+rand = "0.8.5"
 
 [dependencies.mongodb]
 version = "2.2.2"
 default-features = false
-features = ["sync"]
+features = ["tokio-runtime"]
